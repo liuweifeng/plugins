@@ -2547,14 +2547,6 @@ const makePlugin = (site) => async ({ client }) => {
 
   // ask is the answer to a chat completion on the live account cred.
   const ask = async (chat, cred, init, named = "") => {
-    // Capture the vendor's current label, without changing slot IDs.
-    // A failed refresh leaves the reply unnamed beyond its original ID.
-    let servedName
-    if (site.id === "qoder" || site.id === "qoder-cn") {
-      try {
-        servedName = (await models(cred, true)).find((x) => x.key === chat.model)?.name?.trim()
-      } catch {} // the normal request path may still serve a cached slot
-    }
     let m
     try {
       m = (await models(cred)).find((x) => x.key === chat.model) ?? (await models(cred, true)).find((x) => x.key === chat.model)
@@ -2563,6 +2555,8 @@ const makePlugin = (site) => async ({ client }) => {
       return errorResponse({ status: 502, message: e?.message ?? String(e) })
     }
     if (!m) return errorResponse({ status: 400, message: `unknown or disabled model "${chat.model}"` })
+    const name = m.name?.trim()
+    const servedName = name && name !== m.key ? name : chat.model
     const api = siteOf(site, cred).api
     const CHAT_URL = api + CHAT_PATH
     const task = taskOf(sessionOf(chat, named), chat)
@@ -2590,7 +2584,7 @@ const makePlugin = (site) => async ({ client }) => {
       const f = !res.ok ? failure(res.status, (await res.text()).slice(0, 1 << 20)) : open.first.value?.error
       // an answered call moves its task on, as Qoder's client moves it
       if (!f) task.answered = true
-      if (!f?.queue || waited >= QUEUE.recoveries) return f && !res.ok ? errorResponse(f) : answer(open, chat, servedName || chat.model)
+      if (!f?.queue || waited >= QUEUE.recoveries) return f && !res.ok ? errorResponse(f) : answer(open, chat, servedName)
       try {
         if (!(await queueWait(api, cred, ask, f.queue, init.signal, deadline, siteOf(site, cred)))) return errorResponse(f)
       } catch (e) {

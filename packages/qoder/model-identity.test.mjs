@@ -1,15 +1,17 @@
-// Request-time labels preserve stable routing IDs on both Qoder sites.
+// Request-time labels preserve stable routing IDs on the shared Qoder protocol.
 import { afterEach, expect, test } from 'bun:test'
-import { QoderAuthPlugin, QoderCNAuthPlugin, QwenWorkAuthPlugin, _internal } from './index.mjs'
+import { QoderAuthPlugin, QoderCNAuthPlugin, QwenWorkAuthPlugin, QwenWorkEnterpriseAuthPlugin, _internal } from './index.mjs'
 const originalFetch = globalThis.fetch
 afterEach(() => { globalThis.fetch = originalFetch })
 const catalog = { kmodel_latest: 'Kimi-K3', gmodel: 'GLM-5.3', qmodel_latest: 'Qwen3.8-Max', qmodel_38max: 'Qwen3.8-Max', dfmodel: 'DeepSeek-Flash', mmodel: 'MiniMax-M3.1-Flash', ultimate: 'Ultimate', future_slot: 'Future Model' }
 async function fixture(create) {
   const names = { ...catalog }
   let available = true
+  let listingCalls = 0
   const sent = []
   globalThis.fetch = async (url, init) => {
     if (new URL(String(url)).pathname.endsWith('/model/list')) {
+      listingCalls++
       if (!available) return new Response('', { status: 502 })
       const models = Object.entries(names).map(([key, display_name]) => ({ key, display_name, enable: true, max_input_tokens: 131072 }))
       return Response.json({ chat: models, qwork: models })
@@ -22,12 +24,13 @@ async function fixture(create) {
     throw new Error('Unexpected upstream URL')
   }
   const auth = { type: 'oauth', access: 'test-token', refresh: 'test-refresh', expires: Date.now() + 3600000, uid: 'test-user', machineId: 'test-machine' }
+  if (create === QwenWorkEnterpriseAuthPlugin) auth.enterpriseHost = 'acme.example.com'
   const hooks = await create({ client: { auth: { set: async () => {} } } })
   const loader = await hooks.auth.loader(async () => auth)
   const ask = (model, stream = false) => loader.fetch('https://test.invalid/chat/completions', { method: 'POST', body: JSON.stringify({ model, stream, messages: [{ role: 'user', content: 'OK' }] }) })
-  return { ask, sent, names, hooks, auth, fail: () => { available = false } }
+  return { ask, sent, names, hooks, auth, listingCalls: () => listingCalls, refresh: () => hooks.provider.models({ models: {} }, { auth }), fail: () => { available = false } }
 }
-for (const [site, create] of [['qoder', QoderAuthPlugin], ['qoder-cn', QoderCNAuthPlugin]]) {
+for (const [site, create] of [['qoder', QoderAuthPlugin], ['qoder-cn', QoderCNAuthPlugin], ['qwenwork', QwenWorkAuthPlugin], ['qwenwork-enterprise', QwenWorkEnterpriseAuthPlugin]]) {
   for (const stream of [false, true]) {
     test(`${site}: all model labels, duplicate labels and tiers; stream=${stream}`, async () => {
       const f = await fixture(create)
@@ -43,24 +46,57 @@ for (const [site, create] of [['qoder', QoderAuthPlugin], ['qoder-cn', QoderCNAu
       expect(Object.keys(await f.hooks.provider.models({ models: {} }, { auth: f.auth }))).toEqual(Object.keys(catalog))
     })
   }
-  test(`${site}: non-Kimi label changes do not reuse cached names`, async () => {
+  test(`${site}: a cached chat does not fetch the model list again`, async () => {
+    const f = await fixture(create)
+    await f.refresh()
+    expect(f.listingCalls()).toBe(1)
+    for (let i = 0; i < 2; i++) {
+      expect((await (await f.ask('gmodel')).json()).model).toBe('GLM-5.3')
+      expect(f.listingCalls()).toBe(1)
+    }
+  })
+  test(`${site}: the reported name and model_config follow the same cached entry`, async () => {
     const f = await fixture(create)
     expect((await (await f.ask('gmodel')).json()).model).toBe('GLM-5.3')
+    expect(f.listingCalls()).toBe(1)
     f.names.gmodel = 'GLM-Next'
+    expect((await (await f.ask('gmodel')).json()).model).toBe('GLM-5.3')
+    expect(f.sent.at(-1).body.model_config.display_name).toBe('GLM-5.3')
+    expect(f.listingCalls()).toBe(1)
+    await f.refresh()
     expect((await (await f.ask('gmodel')).json()).model).toBe('GLM-Next')
-    f.names.gmodel = ''
-    expect((await (await f.ask('gmodel')).json()).model).toBe('gmodel')
+    expect(f.sent.at(-1).body.model_config.display_name).toBe('GLM-Next')
+    expect(f.listingCalls()).toBe(2)
   })
-  test(`${site}: refresh failure keeps chat available without claiming the old label`, async () => {
+  test(`${site}: a missing cached model still forces exactly one refresh`, async () => {
     const f = await fixture(create)
-    await (await f.ask('gmodel')).text()
+    await f.refresh()
+    f.names.new_slot = 'New Model'
+    expect((await (await f.ask('new_slot')).json()).model).toBe('New Model')
+    expect(f.listingCalls()).toBe(2)
+    expect(f.sent.at(-1).key).toBe('new_slot')
+    expect(f.sent.at(-1).body.model_config.display_name).toBe('New Model')
+  })
+  test(`${site}: empty, missing or unchanged names fall back to the slot ID`, async () => {
+    const f = await fixture(create)
+    for (const name of ['', '   ', undefined, 'gmodel']) {
+      f.names.gmodel = name
+      await f.refresh()
+      expect((await (await f.ask('gmodel')).json()).model).toBe('gmodel')
+    }
+    f.names.gmodel = '  GLM-Next  '
+    await f.refresh()
+    expect((await (await f.ask('gmodel')).json()).model).toBe('GLM-Next')
+  })
+  test(`${site}: a failed normal refresh keeps the request's cached entry`, async () => {
+    const f = await fixture(create)
+    await f.refresh()
     f.fail()
+    await f.refresh()
     const response = await f.ask('gmodel')
     expect(response.status).toBe(200)
-    expect((await response.json()).model).toBe('gmodel')
+    expect((await response.json()).model).toBe('GLM-5.3')
+    expect(f.sent.at(-1).body.model_config.display_name).toBe('GLM-5.3')
+    expect(f.listingCalls()).toBe(2)
   })
 }
-test('QwenWork is not changed by this patch', async () => {
-  const f = await fixture(QwenWorkAuthPlugin)
-  expect((await (await f.ask('gmodel')).json()).model).toBe('gmodel')
-})
