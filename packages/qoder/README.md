@@ -166,6 +166,26 @@ itself.
 
 ## Models
 
+For `qoder` and `qoder-cn`, each chat request refreshes the account's model
+list and reports the requested slot's current display name in the JSON
+completion or SSE chunks. Model-list keys, API IDs, `X-Model-Key` and
+`model_config` still use the original slot ID. Two slots with the same
+name remain independently selectable. This applies to every model,
+including tiers such as `Ultimate` and `Performance`.
+
+A name describes the vendor's catalog at request time, not an attestation
+of the backend that executed the request. If refreshing the list fails or
+no non-empty name is available, the response keeps the requested model ID;
+a cached name is not used to claim a current version. Refreshing adds one
+model-list request. A chat request the cached model information can still
+serve is not rejected solely because that refresh failed.
+
+Magpie records this response name in `Served` and may use it for pricing
+when the requested model has no effective price. Slot-level prices and
+Same-as mappings still take priority. Tier names need not have a known
+price, and this does not rewrite old logs or freeze historical prices.
+QwenWork and QwenWork Enterprise keep their existing response behavior.
+
 The `provider.models` hook reads the account's own list, as Qoder's client
 asks for it (`/algo/api/v2/model/list`). It keeps the enabled models of the
 listing's `app` scene, the list Qoder's app shows and the one a request

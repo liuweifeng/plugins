@@ -1685,7 +1685,7 @@ async function opened(res, tools) {
   return { it, first: await it.next() }
 }
 
-async function answer({ it, first }, chat) {
+async function answer({ it, first }, chat, servedName = chat.model) {
   const id = "chatcmpl-" + hexID()
   const created = Math.floor(Date.now() / 1000)
   if (first.value?.error) return errorResponse(first.value.error)
@@ -1708,12 +1708,12 @@ async function answer({ it, first }, chat) {
     }
     if (reasoning) msg.reasoning_content = reasoning
     if (calls.length) msg.tool_calls = calls
-    return Response.json({ id, object: "chat.completion", created, model: chat.model, choices: [{ index: 0, message: msg, finish_reason: stop }], ...(usage ? { usage } : {}) })
+    return Response.json({ id, object: "chat.completion", created, model: servedName, choices: [{ index: 0, message: msg, finish_reason: stop }], ...(usage ? { usage } : {}) })
   }
 
   const enc = new TextEncoder()
   const chunk = (delta, finish_reason = null, extra = {}) =>
-    enc.encode(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: chat.model, choices: [{ index: 0, delta, finish_reason }], ...extra })}\n\n`)
+    enc.encode(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: servedName, choices: [{ index: 0, delta, finish_reason }], ...extra })}\n\n`)
   let pending = first
   let began = false
   const stream = new ReadableStream({
@@ -2547,6 +2547,14 @@ const makePlugin = (site) => async ({ client }) => {
 
   // ask is the answer to a chat completion on the live account cred.
   const ask = async (chat, cred, init, named = "") => {
+    // Capture the vendor's current label, without changing slot IDs.
+    // A failed refresh leaves the reply unnamed beyond its original ID.
+    let servedName
+    if (site.id === "qoder" || site.id === "qoder-cn") {
+      try {
+        servedName = (await models(cred, true)).find((x) => x.key === chat.model)?.name?.trim()
+      } catch {} // the normal request path may still serve a cached slot
+    }
     let m
     try {
       m = (await models(cred)).find((x) => x.key === chat.model) ?? (await models(cred, true)).find((x) => x.key === chat.model)
@@ -2582,7 +2590,7 @@ const makePlugin = (site) => async ({ client }) => {
       const f = !res.ok ? failure(res.status, (await res.text()).slice(0, 1 << 20)) : open.first.value?.error
       // an answered call moves its task on, as Qoder's client moves it
       if (!f) task.answered = true
-      if (!f?.queue || waited >= QUEUE.recoveries) return f && !res.ok ? errorResponse(f) : answer(open, chat)
+      if (!f?.queue || waited >= QUEUE.recoveries) return f && !res.ok ? errorResponse(f) : answer(open, chat, servedName || chat.model)
       try {
         if (!(await queueWait(api, cred, ask, f.queue, init.signal, deadline, siteOf(site, cred)))) return errorResponse(f)
       } catch (e) {
